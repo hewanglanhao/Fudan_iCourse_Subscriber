@@ -16,7 +16,6 @@ vosk-model-*/
 .vscode/
 .idea/
 .playwright-mcp/
-docs/
 
 任务描述.md
 get_course_text/
