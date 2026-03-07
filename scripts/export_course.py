@@ -1,14 +1,20 @@
-"""Export all summaries for a course as an email or PDF attachment.
+"""Export all summaries for one or more courses as emails or PDF attachments.
 
 Usage:
     python scripts/export_course.py --course-id 30004
-    python scripts/export_course.py --course-id 30004 --pdf
+    python scripts/export_course.py --course-id 30004,30005
+    python scripts/export_course.py --course-id 30004,30005 --pdf
 
 Options:
-    --course-id   Course ID to export (required).
+    --course-id   Comma-separated course IDs to export (required).
     --pdf         Convert summaries to PDF and send as attachment.
-                  Without this flag the summaries are sent as an HTML email.
+                  Without this flag the summaries are sent as HTML emails.
     --db          Database path (default: data/icourse.db).
+
+When multiple course IDs are given:
+  - PDF mode:  each course becomes a separate PDF; all PDFs are sent in
+               a single email as attachments.
+  - Email mode: each course is sent as a separate HTML email.
 """
 
 import argparse
@@ -17,6 +23,7 @@ import smtplib
 import sys
 from email import encoders
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -33,12 +40,22 @@ from src.emailer import _EMAIL_CSS, _PYGMENTS_CSS, _md_to_html  # noqa: E402
 # WeasyPrint maps CSS px to physical size at 96 DPI, which makes the
 # pre-scaled latex images appear too small. This CSS lets the renderer
 # size them naturally based on the image's intrinsic dimensions instead.
-_PDF_LATEX_CSS = "img { max-width: 100% !important; height: auto !important; }"
+_PDF_LATEX_CSS = (
+    "img { max-width: 100% !important; height: auto !important; }\n"
+    'body { font-family: "SimSun", "Noto Serif CJK SC", "AR PL SungtiL GB", serif; }'
+)
 
 
 def _build_html(course_title: str, teacher: str, lectures: list[dict],
-                pdf: bool = False) -> str:
-    """Build a complete styled HTML document from course summaries."""
+                pdf: bool = False, cid_images: dict | None = None) -> str:
+    """Build a complete styled HTML document from course summaries.
+
+    Args:
+        cid_images: When provided (dict), LaTeX images are downloaded and
+                    embedded via CID references.  The dict is populated with
+                    ``{cid_name: png_bytes}`` entries for the caller to attach
+                    to the MIME message.
+    """
     body_parts = [
         f"<h1>{escape(course_title)}</h1>",
         f"<p>任课教师：{escape(teacher)}</p>",
@@ -49,7 +66,7 @@ def _build_html(course_title: str, teacher: str, lectures: list[dict],
             f"<h2>{escape(lec['sub_title'])} "
             f"<small>({escape(lec['date'])})</small></h2>"
         )
-        body_parts.append(_md_to_html(lec["summary"]))
+        body_parts.append(_md_to_html(lec["summary"], cid_images=cid_images))
         body_parts.append("<hr>")
 
     extra_css = f"\n{_PDF_LATEX_CSS}" if pdf else ""
@@ -85,61 +102,75 @@ def _smtp_connect():
     return server
 
 
-def _send_html_email(subject: str, html: str, plain: str) -> None:
-    """Send a multipart HTML email."""
-    msg = MIMEMultipart("alternative")
+def _send_html_email(subject: str, html: str, plain: str,
+                     cid_images: dict[str, bytes] | None = None) -> None:
+    """Send a multipart HTML email with CID-embedded LaTeX images.
+
+    Uses ``multipart/related`` wrapping ``multipart/alternative`` so that
+    CID image references in the HTML resolve correctly, matching the MIME
+    structure used in the main programme (``src/emailer.py``).
+    """
+    msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = formataddr(("iCourse Subscriber", config.SMTP_EMAIL))
     msg["To"] = config.RECEIVER_EMAIL
-    msg.attach(MIMEText(plain, "plain", "utf-8"))
-    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    msg_alt = MIMEMultipart("alternative")
+    msg_alt.attach(MIMEText(plain, "plain", "utf-8"))
+    msg_alt.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(msg_alt)
+
+    if cid_images:
+        for cid, png_data in cid_images.items():
+            img_part = MIMEImage(png_data, "png")
+            img_part.add_header("Content-ID", f"<{cid}>")
+            img_part.add_header("Content-Disposition", "inline",
+                                filename=f"{cid}.png")
+            msg.attach(img_part)
 
     with _smtp_connect() as server:
         server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
 
 
-def _send_pdf_email(subject: str, pdf_bytes: bytes, filename: str) -> None:
-    """Send an email with a PDF file attached."""
+def _send_pdf_email(subject: str,
+                    attachments: list[tuple[bytes, str]]) -> None:
+    """Send an email with one or more PDF files attached.
+
+    Args:
+        attachments: List of ``(pdf_bytes, filename)`` tuples.
+    """
     msg = MIMEMultipart()
     msg["Subject"] = subject
     msg["From"] = formataddr(("iCourse Subscriber", config.SMTP_EMAIL))
     msg["To"] = config.RECEIVER_EMAIL
 
-    part = MIMEBase("application", "pdf", name=filename)
-    part.set_payload(pdf_bytes)
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", "attachment", filename=filename)
-    msg.attach(part)
+    for pdf_bytes, filename in attachments:
+        part = MIMEBase("application", "pdf", name=filename)
+        part.set_payload(pdf_bytes)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
 
     with _smtp_connect() as server:
         server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Export course summaries.")
-    parser.add_argument("--course-id", required=True, help="Course ID to export")
-    parser.add_argument(
-        "--pdf",
-        action="store_true",
-        help="Export as PDF attachment instead of inline HTML email",
-    )
-    parser.add_argument(
-        "--db", default="data/icourse.db", help="Database path (default: data/icourse.db)"
-    )
-    args = parser.parse_args()
+def _safe_filename(title: str) -> str:
+    """Sanitise a course title for use as a filename."""
+    return "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
 
-    if not os.path.isfile(args.db):
-        print(f"Database not found: {args.db}")
-        sys.exit(1)
 
-    db = Database(args.db)
+def _query_course(db: Database, course_id: str):
+    """Return ``(course_title, teacher, lectures)`` for *course_id*.
 
+    Returns ``None`` if the course is missing or has no summaries.
+    """
     course = db.conn.execute(
-        "SELECT * FROM courses WHERE course_id = ?", (args.course_id,)
+        "SELECT * FROM courses WHERE course_id = ?", (course_id,)
     ).fetchone()
     if not course:
-        print(f"Course {args.course_id} not found in database.")
-        sys.exit(1)
+        print(f"Course {course_id} not found in database – skipping.")
+        return None
 
     course_title = course["title"]
     teacher = course["teacher"]
@@ -149,22 +180,50 @@ def main():
            FROM lectures
            WHERE course_id = ? AND summary IS NOT NULL
            ORDER BY CAST(sub_id AS INTEGER) ASC""",
-        (args.course_id,),
+        (course_id,),
     ).fetchall()
     lectures = [dict(row) for row in rows]
 
     if not lectures:
-        print(f"No summaries found for course {args.course_id} ({course_title}).")
-        sys.exit(0)
+        print(f"No summaries found for course {course_id} ({course_title}) – skipping.")
+        return None
 
     print(f"Found {len(lectures)} summarized lecture(s) for {course_title}.")
+    return course_title, teacher, lectures
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export course summaries.")
+    parser.add_argument(
+        "--course-id", required=True,
+        help="Comma-separated course IDs to export (e.g. 30004 or 30004,30005)",
+    )
+    parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Export as PDF attachment instead of inline HTML email",
+    )
+    parser.add_argument(
+        "--db", default="data/icourse.db",
+        help="Database path (default: data/icourse.db)",
+    )
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.db):
+        print(f"Database not found: {args.db}")
+        sys.exit(1)
+
+    db = Database(args.db)
+
+    # Parse comma-separated course IDs
+    course_ids = [cid.strip() for cid in args.course_id.split(",") if cid.strip()]
+    if not course_ids:
+        print("No valid course IDs provided.")
+        sys.exit(1)
 
     if not config.SMTP_EMAIL or not config.SMTP_PASSWORD or not config.RECEIVER_EMAIL:
         print("Email configuration incomplete. Set SMTP_EMAIL, SMTP_PASSWORD, RECEIVER_EMAIL.")
         sys.exit(1)
-
-    html = _build_html(course_title, teacher, lectures, pdf=args.pdf)
-    subject = f"[iCourse 课程摘要导出] {course_title}"
 
     if args.pdf:
         try:
@@ -173,18 +232,58 @@ def main():
             print("weasyprint is required for PDF export. Install it with: pip install weasyprint")
             sys.exit(1)
 
-        print("Generating PDF...")
-        pdf_bytes = weasyprint.HTML(string=html).write_pdf()
-        safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in course_title)
-        filename = f"{safe_title}_summaries.pdf"
-        print(f"Sending PDF email ({len(pdf_bytes)} bytes)...")
-        _send_pdf_email(subject, pdf_bytes, filename)
-    else:
-        plain = _build_plain(course_title, teacher, lectures)
-        print("Sending HTML email...")
-        _send_html_email(subject, html, plain)
+        # PDF mode: one PDF per course, all PDFs in one email
+        attachments: list[tuple[bytes, str]] = []
+        titles: list[str] = []
+        for cid in course_ids:
+            result = _query_course(db, cid)
+            if result is None:
+                continue
+            course_title, teacher, lectures = result
+            titles.append(course_title)
 
-    print(f"[OK] Sent: {subject}")
+            html = _build_html(course_title, teacher, lectures, pdf=True)
+            print(f"Generating PDF for {course_title}...")
+            pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+            filename = f"{_safe_filename(course_title)}_summaries.pdf"
+            attachments.append((pdf_bytes, filename))
+            print(f"  PDF ready ({len(pdf_bytes)} bytes): {filename}")
+
+        if not attachments:
+            print("No courses with summaries found – nothing to send.")
+            sys.exit(0)
+
+        subject = "[iCourse 课程摘要导出] " + ", ".join(titles)
+        total_bytes = sum(len(b) for b, _ in attachments)
+        print(f"Sending email with {len(attachments)} PDF(s) ({total_bytes} bytes)...")
+        _send_pdf_email(subject, attachments)
+        print(f"[OK] Sent: {subject}")
+
+    else:
+        # Email mode: one CID-embedded HTML email per course
+        sent = 0
+        for cid in course_ids:
+            result = _query_course(db, cid)
+            if result is None:
+                continue
+            course_title, teacher, lectures = result
+
+            cid_images: dict[str, bytes] = {}
+            html = _build_html(course_title, teacher, lectures,
+                               cid_images=cid_images)
+            plain = _build_plain(course_title, teacher, lectures)
+            subject = f"[iCourse 课程摘要导出] {course_title}"
+
+            print(f"Sending HTML email for {course_title}...")
+            if cid_images:
+                print(f"  Embedded {len(cid_images)} LaTeX image(s) as CID")
+            _send_html_email(subject, html, plain, cid_images=cid_images)
+            print(f"[OK] Sent: {subject}")
+            sent += 1
+
+        if sent == 0:
+            print("No courses with summaries found – nothing to send.")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
