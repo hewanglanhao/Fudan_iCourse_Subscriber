@@ -2,8 +2,9 @@ name: iCourse Check
 
 on:
   schedule:
-    # Every day at 21:00 BTC (UTC + 8)
-    - cron: "0 13 * * *"
+    # Every day at 20:53 BTC (UTC + 8)
+    # 设计这个奇怪的时间是为了避免整点时的github队列峰值，避免排队过久。
+    - cron: "53 12 * * *"
   workflow_dispatch:
 
 permissions:
@@ -34,7 +35,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install ffmpeg
-        run: sudo apt-get install -y ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Cache ASR models
         id: cache-models
