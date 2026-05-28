@@ -246,9 +246,15 @@ def _send_unsent_for_course(emailer: Emailer | None, db: Database,
     ]
     if not unsent:
         if raw_unsent:
+            skipped = ", ".join(
+                f"{row.get('date') or '?'} {row.get('sub_title') or row['sub_id']}"
+                for row in raw_unsent[:5]
+            )
+            if len(raw_unsent) > 5:
+                skipped += ", ..."
             reporter.info(
                 f"[Email] Course {course_id}: {len(raw_unsent)} unsent "
-                "lecture(s), 0 after date filter."
+                f"lecture(s), 0 after date filter. Skipped: {skipped}"
             )
         else:
             reporter.info(
