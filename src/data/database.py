@@ -480,3 +480,18 @@ class Database:
                  AND l.summary IS NOT NULL""",
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_unsent_lectures_for_course(self, course_id: str) -> list[dict]:
+        """Find processed-but-unemailed lectures for one course."""
+        rows = self.conn.execute(
+            """SELECT l.*, c.title AS course_title, c.teacher
+               FROM lectures l
+               JOIN courses c ON l.course_id = c.course_id
+               WHERE l.course_id = ?
+                 AND l.processed_at IS NOT NULL
+                 AND l.emailed_at IS NULL
+                 AND l.summary IS NOT NULL
+               ORDER BY l.date, l.sub_id""",
+            (course_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]

@@ -170,16 +170,7 @@ def _drive_lectures(client: ICourseClient, db: Database,
                 course_id, course_title, lecture, next_info=next_info,
             )
             if summary:
-                current = db.get_lecture(sub_id)
-                if current and current.get("emailed_at"):
-                    continue
-                _send_email_items(emailer, db, reporter, [{
-                    "sub_id": sub_id,
-                    "course_title": course_title,
-                    "sub_title": lecture.get("sub_title", sub_id),
-                    "date": lecture.get("date", ""),
-                    "summary": summary,
-                }])
+                _send_unsent_for_course(emailer, db, reporter, course_id)
         except Exception:
             reporter.lecture_error(sub_id)
             traceback.print_exc()
@@ -192,38 +183,45 @@ def _drive_lectures(client: ICourseClient, db: Database,
 
 
 def _send_email_items(emailer: Emailer | None, db: Database,
-                      reporter: Reporter, items: list[dict]) -> None:
+                      reporter: Reporter, items: list[dict]) -> bool:
     """Send one email payload and mark those lectures as emailed on success."""
     if not (emailer and items):
-        return
+        return False
     try:
         reporter.email_summary(len(items))
         if emailer.send(items):
             db.mark_emailed_batch([item["sub_id"] for item in items])
+            return True
         else:
             reporter.email_failed()
     except Exception:
         reporter.info("[Email] Failed to send:")
         traceback.print_exc()
+    return False
 
 
-def _send_recovered_unsent(emailer: Emailer | None, db: Database,
-                           reporter: Reporter) -> None:
-    """Send previously processed-but-unsent lectures one by one."""
+def _send_unsent_for_course(emailer: Emailer | None, db: Database,
+                            reporter: Reporter, course_id: str,
+                            update_sub_ids: set[str] | None = None) -> bool:
+    """Send all processed-but-unsent lectures for one course in one email."""
     if not emailer:
-        return
-    unsent = db.get_unsent_lectures()
+        return False
+    unsent = db.get_unsent_lectures_for_course(course_id)
     if not unsent:
-        return
-    reporter.email_recovered_unsent(len(unsent))
-    for row in unsent:
-        _send_email_items(emailer, db, reporter, [{
+        return False
+    update_sub_ids = update_sub_ids or set()
+    items = [
+        {
             "sub_id": row["sub_id"],
             "course_title": row["course_title"],
             "sub_title": row["sub_title"],
             "date": row["date"],
             "summary": row["summary"],
-        }])
+            "is_update": row["sub_id"] in update_sub_ids,
+        }
+        for row in unsent
+    ]
+    return _send_email_items(emailer, db, reporter, items)
 
 
 def _crawl_semester_catalog(client: ICourseClient, db: Database,
@@ -312,8 +310,6 @@ def run():
         reporter.run_footer()
         return
 
-    _send_recovered_unsent(emailer, db, reporter)
-
     scheduler = Scheduler(reporter=reporter)
 
     try:
@@ -335,8 +331,9 @@ def run():
                     client, db, summarizer, ppt_pipeline, reporter,
                     [], config.COURSE_IDS,
                     check_session_fn=_check_session,
-                    email_callback=lambda item: _send_email_items(
-                        emailer, db, reporter, [item],
+                    email_callback=lambda item: _send_unsent_for_course(
+                        emailer, db, reporter, item["course_id"],
+                        update_sub_ids={item["sub_id"]},
                     ),
                 )
             except Exception:

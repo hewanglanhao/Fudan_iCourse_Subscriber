@@ -347,6 +347,7 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
                 continue
             item = {
                 "sub_id": sub_id,
+                "course_id": course_id,
                 "course_title": course_title,
                 "sub_title": sub_title,
                 "date": date,
