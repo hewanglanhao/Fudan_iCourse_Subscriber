@@ -237,13 +237,28 @@ def _send_unsent_for_course(emailer: Emailer | None, db: Database,
                             update_sub_ids: set[str] | None = None) -> bool:
     """Send all processed-but-unsent lectures for one course in one email."""
     if not emailer:
+        reporter.info("[Email] SMTP is not configured; skipping sends.")
         return False
+    raw_unsent = db.get_unsent_lectures_for_course(course_id)
     unsent = [
-        row for row in db.get_unsent_lectures_for_course(course_id)
+        row for row in raw_unsent
         if _lecture_passes_date_filter(row)
     ]
     if not unsent:
+        if raw_unsent:
+            reporter.info(
+                f"[Email] Course {course_id}: {len(raw_unsent)} unsent "
+                "lecture(s), 0 after date filter."
+            )
+        else:
+            reporter.info(
+                f"[Email] Course {course_id}: no unsent lecture(s)."
+            )
         return False
+    reporter.info(
+        f"[Email] Course {course_id}: sending {len(unsent)} unsent "
+        f"lecture(s)."
+    )
     update_sub_ids = update_sub_ids or set()
     items = [
         {
