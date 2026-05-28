@@ -167,6 +167,7 @@ jobs:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ secrets.COURSE_IDS }}
+          LECTURE_AFTER_DATE: ${{ secrets.LECTURE_AFTER_DATE }}
           CRAWL_TERM: ${{ secrets.CRAWL_TERM }}
           RESUMMARIZE_OLD: "1"
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}

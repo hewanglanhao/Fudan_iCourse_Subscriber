@@ -157,6 +157,7 @@ jobs:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ inputs.course_ids }}
+          LECTURE_AFTER_DATE: ${{ secrets.LECTURE_AFTER_DATE }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
