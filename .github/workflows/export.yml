@@ -7,11 +7,19 @@ on:
         description: "Course ID(s) to export, comma-separated (e.g. 30004 or 30004,30005)"
         required: true
         type: string
-      export_pdf:
-        description: "Export as PDF attachment (uncheck to send as HTML email)"
+      export_type:
+        description: "Choose export type,if use HTML email,there will be no attachment, just the email body."
+        type: choice
+        options:
+          - HTML
+          - PDF
+          - Markdown
+        default: 'HTML'
+      sub_ids:
+        description: "Optional comma-separated lecture sub_ids to filter (default: all summarized lectures)"
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -47,24 +55,62 @@ jobs:
       - name: Fetch database from data branch
         run: |
           mkdir -p data
-          curl -fL -o data/icourse.db.enc.tmp \
-            "https://raw.githubusercontent.com/${{ github.repository }}/data/data/icourse.db.enc" \
-            || echo "Fetch from data branch failed."
-          if [ -f data/icourse.db.enc.tmp ]; then
-            mv data/icourse.db.enc.tmp data/icourse.db.enc
-            echo "Database loaded from data branch."
+          git fetch origin data --depth=1
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            mkdir -p data/sharded/shards
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
+          elif git cat-file -e origin/data:data/icourse.db.gz.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
+            echo "Loaded legacy compressed database."
+          elif git cat-file -e origin/data:data/icourse.db.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
+            echo "Loaded legacy uncompressed database."
           else
             echo "::error::No database found on data branch."
             exit 1
           fi
 
-      - name: Decrypt database
+      - name: Decode database
         env:
-          DB_KEY: ${{ secrets.STUID }}${{ secrets.UISPSW }}${{ secrets.DASHSCOPE_API_KEY }}${{ secrets.SMTP_PASSWORD }}
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
-          openssl enc -aes-256-cbc -d -pbkdf2 \
-            -in data/icourse.db.enc -out data/icourse.db \
-            -pass env:DB_KEY
+          if [ -f data/sharded/icourse-index.enc ]; then
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+            echo "Reassembled sharded database."
+            exit 0
+          fi
+
+          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
+          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
+
+          decrypt_blob() {
+            local in_path="$1"
+            local out_path="$2"
+            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
+                 -in "$in_path" -out "$out_path" \
+                 -pass pass:"$NEW_KEY" 2>/dev/null; then
+              return 0
+            fi
+            openssl enc -aes-256-cbc -d -pbkdf2 \
+              -in "$in_path" -out "$out_path" \
+              -pass pass:"$LEGACY_KEY" 2>/dev/null
+          }
+
+          if [ -f data/icourse.db.gz.enc ]; then
+            decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz
+            gzip -d data/icourse.db.gz
+          else
+            decrypt_blob data/icourse.db.enc data/icourse.db
+          fi
           echo "Database decrypted."
 
       - name: Export course summaries
@@ -73,9 +119,22 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           EXPORT_COURSE_ID: ${{ inputs.course_id }}
+          EXPORT_SUB_IDS: ${{ inputs.sub_ids }}
+          EXPORT_MD: ${{ inputs.export_md }}
         run: |
-          if [ "${{ inputs.export_pdf }}" = "true" ]; then
-            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" --pdf
+          case "${{ inputs.export_type }}" in
+            "HTML")
+              EXPORT_FLAG=""
+              ;;
+            "PDF")
+              EXPORT_FLAG="--pdf"
+              ;;
+            "Markdown")
+              EXPORT_FLAG="--md"
+              ;;
+          esac
+          if [ -n "$EXPORT_SUB_IDS" ]; then
+            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" --sub-ids "$EXPORT_SUB_IDS" $EXPORT_FLAG
           else
-            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID"
+            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" $EXPORT_FLAG
           fi

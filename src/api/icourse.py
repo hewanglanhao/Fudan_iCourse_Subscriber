@@ -11,8 +11,34 @@ import time
 import uuid
 from urllib.parse import urlparse
 
-from . import config
-from .webvpn import WebVPNSession
+from src.runtime import config
+from src.api.webvpn import WebVPNSession, get_vpn_url
+
+
+def fetch_ppt_image(client: "ICourseClient", item: dict,
+                    max_attempts: int = 2, timeout: int = 30) -> bytes | None:
+    """Download a single PPT image. Returns bytes or None on persistent failure.
+
+    Module-level (not a method on ICourseClient) so worker threads in the
+    scheduler can call it without binding the function name at import time —
+    that way tests can monkey-patch ``src.icourse.fetch_ppt_image`` and the
+    scheduler will pick up the replacement on its next worker invocation.
+    """
+    url = item["pptimgurl"]
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if url.startswith(config.WEBVPN_BASE):
+                resp = client.vpn.get_raw(url, timeout=timeout)
+            else:
+                resp = client.vpn.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            print(f"[PPTFetcher] download failed (attempt "
+                  f"{attempt}/{max_attempts}): {type(e).__name__}: {e}")
+            if attempt < max_attempts:
+                time.sleep(1)
+    return None
 
 
 class ICourseClient:
@@ -122,24 +148,85 @@ class ICourseClient:
 
         return {"title": title, "teacher": teacher, "lectures": lectures}
 
+    def get_ppt_list(self, course_id: str, sub_id: str,
+                     per_page: int = 100) -> list[dict]:
+        """Fetch PPT screenshot list for a lecture.
+
+        Walks pagination until exhausted. Returns a flat list of items, each:
+            {
+              "id": int,                # row id
+              "pptimgurl": str,         # full image URL (used for OCR)
+              "pptthumb": str,          # thumbnail URL (kept for reference)
+              "created_sec": int,       # offset within lecture, in seconds
+              "created_ms": int,        # original epoch ms timestamp
+              "taskid": str,
+            }
+        Sorted by created_sec ascending.
+        """
+        import json
+        items = []
+        page = 1
+        while True:
+            url = f"{self.base_url}/pptnote/v1/schedule/search-ppt"
+            resp = self.vpn.get(
+                url,
+                params={
+                    "course_id": course_id, "sub_id": sub_id,
+                    "page": page, "per_page": per_page,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"search-ppt failed: {data.get('msg')}")
+            page_items = data.get("list", [])
+            if not page_items:
+                break
+            for raw in page_items:
+                try:
+                    content = json.loads(raw.get("content", "{}"))
+                except (ValueError, TypeError):
+                    continue
+                img_url = content.get("pptimgurl")
+                if not img_url:
+                    continue
+                items.append({
+                    "id": raw.get("id"),
+                    "pptimgurl": img_url,
+                    "pptthumb": content.get("pptthumb", ""),
+                    "created_sec": int(raw.get("created_sec", 0) or 0),
+                    "created_ms": int(content.get("created", 0) or 0),
+                    "taskid": content.get("taskid", ""),
+                })
+            if len(page_items) < per_page:
+                break
+            page += 1
+        items.sort(key=lambda x: x["created_sec"])
+        return items
+
     def get_course_list(
         self, term: str = "24", page: int = 1, per_page: int = 20
     ) -> dict:
         """Get a paginated list of courses for a given term.
 
-        Returns dict with keys: total, courses (list of course dicts)
+        Returns dict with keys: total, courses (list of course dicts).
+        Empty-string filter params are omitted so the API returns all
+        courses rather than searching for "".
         """
         url = f"{self.base_url}/portal/courseapi/v3/multi-search/get-course-list"
-        params = {
+        # Omitting empty-string params matters — some backends treat
+        # ``title=""`` as "search for nothing" rather than "no filter".
+        params: dict[str, str | int] = {
             "tenant": config.TENANT_CODE,
-            "title": "",
             "term": term,
-            "kkxy_code": "",
-            "course_type": "",
-            "course_student_type": "",
             "page": page,
             "per_page": per_page,
         }
+        for key in ("title", "kkxy_code", "course_type", "course_student_type"):
+            val = getattr(config, key.upper(), "") if key.isupper() else ""
+            if not val:
+                continue
+            params[key] = val
         resp = self.vpn.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -152,6 +239,92 @@ class ICourseClient:
             "total": int(result.get("total", 0)),
             "courses": result.get("list", []),
         }
+
+    def discover_terms(self, code_min: int = 10,
+                       code_max: int = 35) -> list[dict]:
+        """Scan term codes to discover all available semesters.
+
+        Returns ``[{code, name, count}]`` sorted by code descending
+        (newest first).  Only codes returning >0 courses are included.
+        """
+        results: list[dict] = []
+        for code in range(code_min, code_max + 1):
+            try:
+                resp = self.get_course_list(
+                    term=str(code), page=1, per_page=1,
+                )
+                total = resp.get("total", 0)
+                if not total:
+                    continue
+                courses = resp.get("courses", [])
+                name = (courses[0].get("term_name") if courses else None) or str(code)
+                results.append({"code": str(code), "name": name,
+                                "count": total})
+            except Exception:
+                continue
+        return sorted(results, key=lambda x: -int(x["code"]))
+
+    def list_semester_courses(self, term: str,
+                              per_page: int = 500) -> list[dict]:
+        """Walk every page of get-course-list for ``term``.
+
+        Uses ``total`` from the first response to compute the exact page
+        count — no hard-coded max.  (Caller must ensure the API hasn't
+        silently capped ``per_page`` below the requested value.)
+
+        Returns a flat list of ``{course_id, title, teacher, dept}`` dicts,
+        deduped by course_id.
+        """
+        import math
+
+        out: list[dict] = []
+        seen: set[str] = set()
+
+        # Page 1 — discover total
+        result = self.get_course_list(
+            term=term, page=1, per_page=per_page,
+        )
+        total_expected = result.get("total") or 0
+        if not total_expected:
+            return out
+        total_pages = max(1, math.ceil(total_expected / per_page))
+
+        def _process(page_items):
+            for raw in page_items:
+                cid = raw.get("id") or raw.get("course_id")
+                if not cid:
+                    continue
+                cid = str(cid)
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                dept = (
+                    raw.get("kkxy_name") or raw.get("school_name")
+                    or raw.get("dept_name") or raw.get("kkxy") or None
+                )
+                out.append({
+                    "course_id": cid,
+                    "title": raw.get("title") or "",
+                    "teacher": raw.get("realname") or raw.get("teacher") or "",
+                    "dept": dept,
+                })
+
+        page_items = result.get("courses", [])
+        if not page_items:
+            return out
+        _process(page_items)
+
+        # Remaining pages 2 .. total_pages
+        for page in range(2, total_pages + 1):
+            result = self.get_course_list(
+                term=term, page=page, per_page=per_page,
+            )
+            page_items = result.get("courses", [])
+            if not page_items:
+                break
+            _process(page_items)
+
+        return out
 
     def get_lecture_detail(self, course_id: str, sub_id: str) -> dict:
         """Get details for a specific lecture, including video URL info.
@@ -221,9 +394,14 @@ class ICourseClient:
     def get_sub_info(self, course_id: str, sub_id: str) -> dict:
         """Get lecture info including video URLs and timestamp.
 
-        Returns the full sub-info data from the API.
-        The playurl dict maps stream indices to video URLs.
-        The 'now' field provides the server timestamp for CDN signing.
+        Returns the data payload from the API.
+
+        Non-zero API codes that still ship a populated data payload
+        (notably 7001 "视频未到开放时间", the school's 24h pre-release
+        review gate) are returned as partial data so the caller can
+        extract the video URL from nested content.playback.url — the
+        gate scrubs top-level video_list/playurl but not the nested
+        URL.  Only raises on HTTP failure or an entirely empty payload.
         """
         url = (
             f"{self.base_url}"
@@ -234,27 +412,38 @@ class ICourseClient:
         })
         resp.raise_for_status()
         data = resp.json()
+        payload = data.get("data") or {}
 
-        if data.get("code") != 0:
+        if data.get("code") != 0 and not payload:
             raise RuntimeError(
                 f"API error for sub-info {sub_id}: {data.get('msg')}"
             )
 
-        return data.get("data", {})
+        return payload
 
     def get_video_url(self, course_id: str, sub_id: str) -> str | None:
         """Get a signed MP4 video URL for a specific lecture.
 
-        Uses the get-sub-info API to get the base video URL, then
-        signs it with CDN authentication parameters (clientUUID, t).
+        Cascades through URL sources, most- to least-preferred:
+          1. info.video_list[*].preview_url     — healthy lecture
+          2. info.playurl[*]                    — healthy alternate
+          3. info.content.playback.url          — review-gated (no extra call)
+          4. get-sub-detail content.playback.url — last resort
 
-        Returns the signed video URL string if found, None otherwise.
+        Sources 3 and 4 cover the school's pre-release review gate
+        (sub-info code 7001 "视频未到开放时间"), which scrubs top-level
+        video_list/playurl but leaves the URL in nested fields.  The
+        CDN itself does not enforce the gate, so a signed URL from
+        either source downloads successfully.
+
+        Returns the signed video URL string, or None if no source yields one.
         """
         try:
             info = self.get_sub_info(course_id, sub_id)
         except Exception as e:
-            print(f"    Failed to get sub info for {sub_id}: {type(e).__name__}")
-            return None
+            print(f"    sub-info unavailable for {sub_id} "
+                  f"({type(e).__name__}); falling back to sub-detail")
+            info = {}
 
         # Get server timestamp for signing
         now = info.get("now")
@@ -285,7 +474,19 @@ class ICourseClient:
                         base_url = v
                         break
 
-        # Last resort: try unsigned get-sub-detail
+        # Review-gate fallback: nested content.playback.url is preserved
+        # even when code == 7001 scrubs the top-level fields above.
+        if not base_url:
+            playback = (info.get("content") or {}).get("playback") or {}
+            nested = playback.get("url")
+            if isinstance(nested, str) and nested.endswith(".mp4"):
+                base_url = nested
+                if not now:
+                    content_now = (info.get("content") or {}).get("now")
+                    if isinstance(content_now, (int, str)):
+                        now = int(content_now)
+
+        # Last resort: hit get-sub-detail (gate-free) directly.
         if not base_url:
             try:
                 detail = self.get_sub_detail(course_id, sub_id)
@@ -297,7 +498,8 @@ class ICourseClient:
                 pass
 
         if not base_url:
-            print(f"    No video URL found for {sub_id} (tried video_list, playurl, sub_detail)")
+            print(f"    No video URL found for {sub_id} (tried video_list, "
+                  f"playurl, content.playback, sub_detail)")
             return None
 
         return self.sign_video_url(base_url, now=now)
@@ -308,7 +510,6 @@ class ICourseClient:
         Returns:
             (vpn_url, http_headers) where http_headers is ffmpeg-compatible.
         """
-        from .webvpn import get_vpn_url
         vpn_url = get_vpn_url(video_url)
         cookies = "; ".join(
             f"{c.name}={c.value}" for c in self.vpn.session.cookies

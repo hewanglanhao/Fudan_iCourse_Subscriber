@@ -17,7 +17,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 import base64
 
-from . import config
+from src.runtime import config
 
 
 def encrypt_host(hostname: str) -> str:
@@ -198,33 +198,54 @@ class WebVPNSession:
         )
         vpn_url = get_vpn_url(casapi_url)
 
-        # Follow redirect chain to reach IDP login page and extract lck
-        resp = self.session.get(vpn_url, allow_redirects=False, timeout=30)
+        # Follow redirect chain to reach IDP login page and extract lck.
+        # The CAS gateway intermittently returns a 200 interstitial or a
+        # 302 to a `/login`-shaped page right after a successful WebVPN
+        # login.  Both are transient — chase the full redirect chain (lck
+        # often appears mid-chain even when an intermediate hop looks
+        # like a stale-session bounce) and retry a few times before
+        # letting login_with_retry() waste a full WebVPN re-login.
+        import time as _time
         lck = None
-        for _ in range(15):
-            location = resp.headers.get("Location", "")
-            if resp.status_code not in (301, 302, 303, 307) or not location:
+        last_locations: list[str] = []
+        for cas_attempt in range(3):
+            if cas_attempt > 0:
+                _time.sleep(2)
+                print(f"    CAS lck extract retry {cas_attempt}/2...")
+            resp = self.session.get(vpn_url, allow_redirects=False, timeout=60)
+            last_locations = []
+            for _ in range(15):
+                location = resp.headers.get("Location", "")
+                if resp.status_code not in (301, 302, 303, 307) or not location:
+                    break
+                last_locations.append(location)
+                lck_match = re.search(r'lck=([^&#"]+)', location)
+                if lck_match:
+                    lck = lck_match.group(1)
+                    break
+                if not location.startswith("http"):
+                    location = urljoin(resp.url, location)
+                resp = self.session.get(
+                    location, allow_redirects=False, timeout=60
+                )
+            if lck:
                 break
-            lck_match = re.search(r'lck=([^&#"]+)', location)
-            if lck_match:
-                lck = lck_match.group(1)
-                break
-            if not location.startswith("http"):
-                location = urljoin(resp.url, location)
-            resp = self.session.get(
-                location, allow_redirects=False, timeout=30
-            )
-
-        if not lck:
-            # Check final response URL and body
-            for source in [resp.url, resp.text[:5000]]:
+            # Check final response for lck embedded in HTML
+            for source in [resp.url, resp.text[:5000],
+                           str(getattr(resp, 'history', []))]:
                 m = re.search(r'lck=([^&#"]+)', source)
                 if m:
                     lck = m.group(1)
                     break
+            if lck:
+                break
         if not lck:
+            # Log the redirect trail so future failures are diagnosable
+            # without re-running with extra prints.
+            trail = " -> ".join(last_locations[-3:]) if last_locations else "<no redirects>"
             raise RuntimeError(
-                f"Failed to extract lck from CAS redirect chain (status={resp.status_code})"
+                f"Failed to extract lck from CAS redirect chain "
+                f"(status={resp.status_code}, last hops: {trail})"
             )
 
         entity_id = config.ICOURSE_BASE
@@ -241,7 +262,7 @@ class WebVPNSession:
                 "Referer": f"{idp_vpn_base}/ac/",
                 "Origin": config.WEBVPN_BASE,
             },
-            timeout=30,
+            timeout=60,
         )
         data = resp.json()
         auth_method_list = data.get("data", [])
@@ -262,7 +283,7 @@ class WebVPNSession:
         resp = self.session.get(
             url,
             headers={"Referer": f"{idp_vpn_base}/ac/"},
-            timeout=30,
+            timeout=60,
         )
         data = resp.json()
         pub_key_b64 = data.get("data", "")
@@ -297,7 +318,7 @@ class WebVPNSession:
                 "Referer": f"{idp_vpn_base}/ac/",
                 "Origin": config.WEBVPN_BASE,
             },
-            timeout=30,
+            timeout=60,
         )
         data = resp.json()
 
@@ -321,7 +342,7 @@ class WebVPNSession:
                 "Referer": f"{idp_vpn_base}/ac/",
                 "Origin": config.WEBVPN_BASE,
             },
-            timeout=30,
+            timeout=60,
         )
         html = resp.text
 
@@ -356,7 +377,7 @@ class WebVPNSession:
         test_url = get_vpn_url(
             f"{config.ICOURSE_BASE}/userapi/v1/infosimple"
         )
-        resp = self.session.get(test_url, timeout=30)
+        resp = self.session.get(test_url, timeout=60)
         if resp.status_code == 200:
             try:
                 user_data = resp.json()
@@ -401,12 +422,12 @@ class WebVPNSession:
             f"{config.IDP_BASE}/idp/authCenter/authenticate"
             f"?service={quote(service_url, safe='')}"
         )
-        resp = self.session.get(url, allow_redirects=False, timeout=30)
+        resp = self.session.get(url, allow_redirects=False, timeout=60)
 
         # Follow redirects manually to extract lck
         location = resp.headers.get("Location", "")
         while resp.status_code in (301, 302) and "lck=" not in location:
-            resp = self.session.get(location, allow_redirects=False, timeout=30)
+            resp = self.session.get(location, allow_redirects=False, timeout=60)
             location = resp.headers.get("Location", "")
 
         if resp.status_code in (301, 302):
@@ -437,7 +458,7 @@ class WebVPNSession:
                 "Referer": f"{config.IDP_BASE}/ac/",
                 "Origin": config.IDP_BASE,
             },
-            timeout=30,
+            timeout=60,
         )
         data = resp.json()
 
@@ -467,7 +488,7 @@ class WebVPNSession:
             headers={
                 "Referer": f"{config.IDP_BASE}/ac/",
             },
-            timeout=30,
+            timeout=60,
         )
         data = resp.json()
         pub_key_b64 = data.get("data", "")
@@ -521,7 +542,7 @@ class WebVPNSession:
                 "Referer": f"{config.IDP_BASE}/ac/",
                 "Origin": config.IDP_BASE,
             },
-            timeout=30,
+            timeout=60,
         )
         data = resp.json()
 
@@ -548,7 +569,7 @@ class WebVPNSession:
                 "Referer": f"{config.IDP_BASE}/ac/",
                 "Origin": config.IDP_BASE,
             },
-            timeout=30,
+            timeout=60,
         )
 
         # The response is HTML containing a JS redirect with the ticket URL
