@@ -259,6 +259,18 @@ def _send_unsent_for_course(emailer: Emailer | None, db: Database,
     return _send_email_items(emailer, db, reporter, items)
 
 
+def _send_unsent_for_idle_courses(emailer: Emailer | None, db: Database,
+                                  reporter: Reporter,
+                                  all_lectures: list[tuple[str, str, dict]]
+                                  ) -> None:
+    """Send unsent summaries for configured courses with no queued work."""
+    queued_course_ids = {course_id for course_id, _, _ in all_lectures}
+    for course_id in config.COURSE_IDS:
+        if course_id in queued_course_ids:
+            continue
+        _send_unsent_for_course(emailer, db, reporter, course_id)
+
+
 def _crawl_semester_catalog(client: ICourseClient, db: Database,
                             reporter: Reporter) -> None:
     """Auto-discover every available semester and refresh ``all_courses``.
@@ -353,6 +365,7 @@ def run():
             client, db, scheduler, transcriber, summarizer, reporter,
             all_lectures, emailer,
         )
+        _send_unsent_for_idle_courses(emailer, db, reporter, all_lectures)
 
         # Resummarize old (pre-v2) lectures, scoped to the courses we're
         # actively monitoring this run.  Opt-in via RESUMMARIZE_OLD=1
