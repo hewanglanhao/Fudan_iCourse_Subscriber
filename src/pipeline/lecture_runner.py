@@ -282,6 +282,7 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
                              reporter: "Reporter",
                              email_items: list, course_ids: list[str],
                              check_session_fn=None,
+                             lecture_filter: Callable[[dict], bool] | None = None,
                              email_callback: Callable[[dict], None] | None = None):
     """Upgrade pre-v2 summaries to PPT-aware v2 format (flat-mode prompt).
 
@@ -296,6 +297,8 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
     monitoring this run.
     """
     targets = db.get_lectures_to_resummarize_for_courses(course_ids)
+    if lecture_filter:
+        targets = [row for row in targets if lecture_filter(row)]
     if not targets:
         return
     reporter.resummarize_header(len(targets))

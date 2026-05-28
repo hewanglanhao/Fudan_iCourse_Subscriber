@@ -1,7 +1,21 @@
 import os
+from datetime import date
 
 STUDENT_ID = os.environ.get("StuId", "")
 PASSWORD = os.environ.get("UISPsw", "")
+
+
+def _parse_date_env(name: str) -> date | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    try:
+        year, month, day = (int(part) for part in value.split("-", 2))
+        return date(year, month, day)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be YYYY-MM-DD, got {value!r}"
+        ) from exc
 
 WEBVPN_BASE = "https://webvpn.fudan.edu.cn"
 IDP_BASE = "https://id.fudan.edu.cn"
@@ -178,6 +192,10 @@ COURSE_IDS = [
     for c in os.environ.get("COURSE_IDS", "").split(",")
     if c.strip()
 ]
+
+# Optional cutoff: when set, only lectures strictly after this date are
+# summarized and emailed.  Example: LECTURE_AFTER_DATE=2026-05-17.
+LECTURE_AFTER_DATE = _parse_date_env("LECTURE_AFTER_DATE")
 
 # 学期级课程目录爬取（已弃用 — main.py 现在自动发现所有学期）。
 # 保留此变量仅用于兼容老部署环境，新部署无需设置。

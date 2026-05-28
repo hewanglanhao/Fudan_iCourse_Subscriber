@@ -31,6 +31,24 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
+def _parse_lecture_date(value: str | None) -> datetime.date | None:
+    if not value:
+        return None
+    try:
+        year, month, day = (int(part) for part in value.split("-", 2))
+        return datetime.date(year, month, day)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lecture_passes_date_filter(lecture: dict) -> bool:
+    cutoff = config.LECTURE_AFTER_DATE
+    if cutoff is None:
+        return True
+    lecture_date = _parse_lecture_date(lecture.get("date"))
+    return bool(lecture_date and lecture_date > cutoff)
+
+
 def login_with_retry(max_attempts: int = 5) -> WebVPNSession:
     """Login to WebVPN + iCourse CAS, retrying on transient failures.
 
@@ -104,6 +122,18 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                 deduped.append(lec)
             lectures = deduped
 
+            if config.LECTURE_AFTER_DATE is not None:
+                before_count = len(lectures)
+                lectures = [
+                    lec for lec in lectures
+                    if _lecture_passes_date_filter(lec)
+                ]
+                reporter.info(
+                    f"  Date filter: after "
+                    f"{config.LECTURE_AFTER_DATE.isoformat()} "
+                    f"({len(lectures)}/{before_count} lecture(s) kept)"
+                )
+
             known_processed = db.get_processed_sub_ids(course_id)
             new_lectures = [
                 lec for lec in lectures
@@ -115,7 +145,9 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
             retry_only = [
                 {"sub_id": u["sub_id"], "sub_title": u["sub_title"],
                  "date": u["date"]}
-                for u in unprocessed if u["sub_id"] not in new_ids
+                for u in unprocessed
+                if u["sub_id"] not in new_ids
+                and _lecture_passes_date_filter(u)
             ]
             new_lectures.extend(retry_only)
             reporter.course_new_count(len(new_lectures))
@@ -206,7 +238,10 @@ def _send_unsent_for_course(emailer: Emailer | None, db: Database,
     """Send all processed-but-unsent lectures for one course in one email."""
     if not emailer:
         return False
-    unsent = db.get_unsent_lectures_for_course(course_id)
+    unsent = [
+        row for row in db.get_unsent_lectures_for_course(course_id)
+        if _lecture_passes_date_filter(row)
+    ]
     if not unsent:
         return False
     update_sub_ids = update_sub_ids or set()
@@ -331,6 +366,7 @@ def run():
                     client, db, summarizer, ppt_pipeline, reporter,
                     [], config.COURSE_IDS,
                     check_session_fn=_check_session,
+                    lecture_filter=_lecture_passes_date_filter,
                     email_callback=lambda item: _send_unsent_for_course(
                         emailer, db, reporter, item["course_id"],
                         update_sub_ids={item["sub_id"]},
