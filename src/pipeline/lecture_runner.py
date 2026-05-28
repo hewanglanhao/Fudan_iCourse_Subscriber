@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from src.ai import bucketer
 from src.pipeline.ppt_pipeline import PPTPipeline
@@ -281,14 +281,16 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
                              ppt_pipeline: PPTPipeline,
                              reporter: "Reporter",
                              email_items: list, course_ids: list[str],
-                             check_session_fn=None):
+                             check_session_fn=None,
+                             email_callback: Callable[[dict], None] | None = None):
     """Upgrade pre-v2 summaries to PPT-aware v2 format (flat-mode prompt).
 
     Old lectures kept their original transcript but never had PPT OCR.  We
     re-run the PPT pipeline against the cached transcript and re-summarize.
-    Each upgraded lecture is appended to ``email_items`` with
-    ``is_update=True`` so Emailer adds the （含 PPT 识别·更新）subject
-    suffix and a 更新 badge.
+    Each upgraded lecture is emitted with ``is_update=True`` so Emailer adds
+    the （含 PPT 识别·更新）subject suffix and a 更新 badge.  Callers can pass
+    ``email_callback`` to send immediately; otherwise the item is appended to
+    ``email_items`` for backward compatibility.
 
     Scoped to ``course_ids`` so we don't re-OCR courses the user isn't
     monitoring this run.
@@ -343,14 +345,18 @@ def resummarize_old_lectures(client: "ICourseClient", db: "Database",
 
             if sub_id in seen_sub_ids:
                 continue
-            email_items.append({
+            item = {
                 "sub_id": sub_id,
                 "course_title": course_title,
                 "sub_title": sub_title,
                 "date": date,
                 "summary": summary,
                 "is_update": True,
-            })
+            }
+            if email_callback:
+                email_callback(item)
+            else:
+                email_items.append(item)
             seen_sub_ids.add(sub_id)
         except Exception:
             reporter.info(f"    [FAIL] Resummarize {sub_id}:")

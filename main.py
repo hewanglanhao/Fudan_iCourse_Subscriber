@@ -8,7 +8,7 @@ AudioDownloader.  This file does only orchestration:
   2. Login + enumerate.
   3. Drive LectureRunner across the queued lectures.
   4. Resummarize old (pre-v2) lectures.
-  5. Email + bookkeeping.
+  5. Email each completed lecture + bookkeeping.
   6. Shutdown.
 
 Anything more interesting belongs in one of ``src/*`` modules.
@@ -140,7 +140,7 @@ def _drive_lectures(client: ICourseClient, db: Database,
                     scheduler: Scheduler, transcriber: Transcriber,
                     summarizer: Summarizer, reporter: Reporter,
                     all_lectures: list[tuple[str, str, dict]],
-                    email_items: list) -> None:
+                    emailer: Emailer | None) -> None:
     """Phase 2: run each lecture through LectureRunner.
 
     Pre-schedules the first lecture's prefetch (audio + images) before
@@ -170,13 +170,16 @@ def _drive_lectures(client: ICourseClient, db: Database,
                 course_id, course_title, lecture, next_info=next_info,
             )
             if summary:
-                email_items.append({
+                current = db.get_lecture(sub_id)
+                if current and current.get("emailed_at"):
+                    continue
+                _send_email_items(emailer, db, reporter, [{
                     "sub_id": sub_id,
                     "course_title": course_title,
                     "sub_title": lecture.get("sub_title", sub_id),
                     "date": lecture.get("date", ""),
                     "summary": summary,
-                })
+                }])
         except Exception:
             reporter.lecture_error(sub_id)
             traceback.print_exc()
@@ -188,34 +191,39 @@ def _drive_lectures(client: ICourseClient, db: Database,
             scheduler.audio_downloader.release(sub_id)
 
 
-def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
-                email_items: list) -> None:
-    """Append any previously-processed-but-unsent lectures, then send."""
-    unsent = db.get_unsent_lectures()
-    if unsent:
-        seen_sub_ids = {item["sub_id"] for item in email_items}
-        for row in unsent:
-            if row["sub_id"] not in seen_sub_ids:
-                email_items.append({
-                    "sub_id": row["sub_id"],
-                    "course_title": row["course_title"],
-                    "sub_title": row["sub_title"],
-                    "date": row["date"],
-                    "summary": row["summary"],
-                })
-        reporter.email_recovered_unsent(len(unsent))
-
-    if not (emailer and email_items):
+def _send_email_items(emailer: Emailer | None, db: Database,
+                      reporter: Reporter, items: list[dict]) -> None:
+    """Send one email payload and mark those lectures as emailed on success."""
+    if not (emailer and items):
         return
     try:
-        reporter.email_summary(len(email_items))
-        if emailer.send(email_items):
-            db.mark_emailed_batch([item["sub_id"] for item in email_items])
+        reporter.email_summary(len(items))
+        if emailer.send(items):
+            db.mark_emailed_batch([item["sub_id"] for item in items])
         else:
             reporter.email_failed()
     except Exception:
         reporter.info("[Email] Failed to send:")
         traceback.print_exc()
+
+
+def _send_recovered_unsent(emailer: Emailer | None, db: Database,
+                           reporter: Reporter) -> None:
+    """Send previously processed-but-unsent lectures one by one."""
+    if not emailer:
+        return
+    unsent = db.get_unsent_lectures()
+    if not unsent:
+        return
+    reporter.email_recovered_unsent(len(unsent))
+    for row in unsent:
+        _send_email_items(emailer, db, reporter, [{
+            "sub_id": row["sub_id"],
+            "course_title": row["course_title"],
+            "sub_title": row["sub_title"],
+            "date": row["date"],
+            "summary": row["summary"],
+        }])
 
 
 def _crawl_semester_catalog(client: ICourseClient, db: Database,
@@ -288,7 +296,6 @@ def run():
 
     vpn = login_with_retry()
     client = ICourseClient(vpn)
-    email_items: list = []
 
     # Refresh the semester catalog: run on the 5th and 25th of each month,
     # or immediately if the database has no catalog data yet.
@@ -305,13 +312,15 @@ def run():
         reporter.run_footer()
         return
 
+    _send_recovered_unsent(emailer, db, reporter)
+
     scheduler = Scheduler(reporter=reporter)
 
     try:
         all_lectures = _enumerate_lectures(client, db, reporter)
         _drive_lectures(
             client, db, scheduler, transcriber, summarizer, reporter,
-            all_lectures, email_items,
+            all_lectures, emailer,
         )
 
         # Resummarize old (pre-v2) lectures, scoped to the courses we're
@@ -324,8 +333,11 @@ def run():
                 ppt_pipeline = PPTPipeline(db, scheduler, reporter)
                 resummarize_old_lectures(
                     client, db, summarizer, ppt_pipeline, reporter,
-                    email_items, config.COURSE_IDS,
+                    [], config.COURSE_IDS,
                     check_session_fn=_check_session,
+                    email_callback=lambda item: _send_email_items(
+                        emailer, db, reporter, [item],
+                    ),
                 )
             except Exception:
                 reporter.info("[Resummarize] phase errored:")
@@ -337,7 +349,6 @@ def run():
     finally:
         scheduler.shutdown()
 
-    _send_email(emailer, db, reporter, email_items)
     reporter.run_footer()
 
 
