@@ -159,6 +159,7 @@ jobs:
           COURSE_IDS: ${{ inputs.course_ids }}
           LECTURE_AFTER_DATE: ${{ secrets.LECTURE_AFTER_DATE }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
