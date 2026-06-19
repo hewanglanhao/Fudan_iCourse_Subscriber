@@ -39,6 +39,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install reset dependencies
+        run: pip install pycryptodome
+
       - name: Fetch database from data branch
         run: |
           mkdir -p data
