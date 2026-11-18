@@ -9,7 +9,7 @@ Handles:
 import html as html_mod
 import re
 from binascii import hexlify, unhexlify
-from urllib.parse import urlparse, urlencode, quote, urljoin
+from urllib.parse import urlparse, urlencode, quote, unquote, urljoin
 
 import requests
 from Crypto.Cipher import AES
@@ -221,7 +221,7 @@ class WebVPNSession:
                 last_locations.append(location)
                 lck_match = re.search(r'lck=([^&#"]+)', location)
                 if lck_match:
-                    lck = lck_match.group(1)
+                    lck = unquote(html_mod.unescape(lck_match.group(1)))
                     break
                 if not location.startswith("http"):
                     location = urljoin(resp.url, location)
@@ -235,7 +235,7 @@ class WebVPNSession:
                            str(getattr(resp, 'history', []))]:
                 m = re.search(r'lck=([^&#"]+)', source)
                 if m:
-                    lck = m.group(1)
+                    lck = unquote(html_mod.unescape(m.group(1)))
                     break
             if lck:
                 break
@@ -328,6 +328,10 @@ class WebVPNSession:
             )
 
         login_token = data.get("loginToken", "")
+        if not login_token:
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                login_token = nested.get("loginToken", "")
         if not login_token:
             raise RuntimeError("No loginToken in iCourse CAS response")
         print("    loginToken: OK")
